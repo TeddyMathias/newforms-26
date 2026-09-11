@@ -1,0 +1,1736 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bypixel 2.0 — Colorizer</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div class="app">
+
+  <header class="topbar">
+    <div class="brand"><b>Bypixel</b><span>2.0</span></div>
+    <div class="doc" id="docName">untitled</div>
+    <div class="spacer"></div>
+    <div class="credit">Created by Pratt New Forms 2026 Students with prof Teddy Mathias</div>
+    <button class="btn" id="btnImport">Import</button>
+    <button class="btn" id="btnCam">Webcam</button>
+    <button class="btn primary" id="btnPng">Export PNG</button>
+    <button class="btn rec" id="btnRec" data-on="false" data-label="Record">Record</button>
+  </header>
+
+  <div class="body">
+
+    <nav class="rail" id="rail"></nav>
+
+    <main class="stage" id="stage" data-tool="recolor">
+      <canvas id="gl"></canvas>
+      <canvas id="ink"></canvas>
+
+      <div class="empty" id="empty" hidden>
+        <h2>Drop an image to colorize</h2>
+        <p>Any PNG, JPG or WEBP. Or turn on the webcam and colorize yourself live.</p>
+        <div class="row">
+          <button class="btn primary" id="emptyImport">Choose file</button>
+          <button class="btn" id="emptyCam">Use webcam</button>
+        </div>
+      </div>
+
+      <div class="drop">Drop to colorize</div>
+
+      <div class="hud" id="hud">—</div>
+
+      <div class="zoomer">
+        <button class="btn" id="zOut">−</button>
+        <div class="val" id="zVal">100%</div>
+        <button class="btn" id="zIn">+</button>
+        <button class="btn" id="zFit">Fit</button>
+      </div>
+    </main>
+
+    <aside class="panel" id="panel"></aside>
+  </div>
+</div>
+
+<input type="file" id="file" accept="image/*" hidden>
+<video id="video" playsinline muted></video>
+
+<script>
+"use strict";
+
+/* =====================================================================
+   BYPIXEL 2.0
+   One image in, infinite color out.
+
+   Everything you see is one fragment shader running over the source
+   pixels. The panel on the right just moves numbers into that shader.
+   ===================================================================== */
+
+const TAU = Math.PI * 2;
+const DEG = Math.PI / 180;
+
+/* ---------------------------------------------------------------
+   1. STATE — every knob in the app lives here
+   --------------------------------------------------------------- */
+
+const S = {
+  // palette
+  palette: ["#ff3366", "#ffcc00", "#00ccff", "#33ff99", "#9933ff"],
+  active: 0,
+  paper: "#ffffff",
+  random: 0,
+
+  // pixels
+  pixel: 8,
+  angle: 0,          // degrees — direction of the pixels AND the color flow
+  mode: 0,           // 0 bands, 1 pixel runs
+  band: 140,         // image px per color, in band mode
+  spread: 200,       // pixels per color, in run mode
+  blend: 0,
+  threshold: 0.72,
+  soft: 0.06,
+  invert: 0,
+
+  // color
+  hue: 0,
+  sat: 1,
+  contrast: 1,
+  bright: 0,
+  pulse: 0,
+  pulseRate: 1.5,
+
+  // motion
+  flow: 0.6,         // colors per second
+  turn: 0,           // deg / second — the colors sweep round, the artwork stays put
+  spiral: 0,
+  twist: 0.5,
+  swirl: 0,          // vortex, winds and unwinds
+  wave: 0,           // undulation depth, % of the artwork
+  mrate: 0.6,        // how fast swirl and wave breathe
+  // shapes — a drawn outline that re-colors whatever is inside it
+  shapeSpeed: 1,
+  shapeSpin: 0,
+  shapeMotion: 0,       // 0 still, 1 orbit, 2 drift
+  shapeShift: 3,        // steps along the palette
+  shapeHue: 0,          // hue turns
+  shapePix: 1,          // pixel size multiplier
+  shapeAngle: 0,        // direction offset, degrees
+  shapeSat: 1,          // saturation multiplier
+  shapeSwap: false,     // flip ink and paper inside the shape
+
+  // touch
+  rsize: 2.2,
+  rdecay: 1.2,
+  rainbow: 1,
+  press: 1,
+
+  // screens
+  screens: 1,
+  variation: 0.5,
+
+  // view
+  zoom: 1,
+  panX: 0, panY: 0,   // image px
+  autofit: true,
+  mirror: true,
+  exportScale: 2,
+
+  // live
+  tool: "recolor",
+  phase: 0,
+  turnPhase: 0,
+  spiralKick: 0,
+  seed: Math.random() * 100,
+  time: 0
+};
+
+const RIPPLE_MAX = 10;
+const ripples = [];           // {x, y, t, w}  — x/y in image pixels
+let pressPt = null;           // {clientX, clientY, w} — follows the screen, not the image
+
+/* ---------------------------------------------------------------
+   2. WEBGL
+   --------------------------------------------------------------- */
+
+const canvas = document.getElementById("gl");
+const gl = canvas.getContext("webgl2", {
+  antialias: false,
+  preserveDrawingBuffer: true,
+  alpha: false
+});
+if (!gl) alert("This browser has no WebGL2. Try Chrome, Safari 15+, or Firefox.");
+
+const VERT = `#version 300 es
+in vec2 a_pos;
+void main() { gl_Position = vec4(a_pos, 0.0, 1.0); }`;
+
+const FRAG = `#version 300 es
+precision highp float;
+
+uniform sampler2D u_tex;
+uniform vec2  u_texSize;
+uniform vec4  u_view;        // viewport x, y, w, h  (device px, y from bottom)
+uniform vec2  u_pan;
+uniform float u_scale;
+uniform float u_time;
+
+uniform float u_pixel;
+uniform float u_angle;
+uniform float u_band;
+uniform float u_mode;          // 0 = geometric bands, 1 = counted pixel runs
+uniform float u_spread;        // pixels painted before the colour changes
+uniform float u_blend;
+uniform float u_threshold;
+uniform float u_soft;
+uniform float u_invert;
+uniform float u_contrast;
+uniform float u_bright;
+
+uniform vec3  u_palette[8];
+uniform int   u_count;
+uniform float u_random;
+uniform vec3  u_paper;
+uniform vec3  u_bg;
+uniform float u_phase;
+uniform float u_spiral;
+uniform float u_turn;          // the whole colour field, swung round
+uniform float u_swirl;         // vortex angle at the centre, right now
+uniform float u_wave;          // undulation depth, in image pixels
+uniform float u_waveT;
+uniform float u_twist;
+uniform float u_hue;
+uniform float u_sat;
+uniform float u_seed;
+uniform float u_mirror;
+
+uniform sampler2D u_shapes;    // atlas of the drawn shapes
+uniform vec4  u_shapeXf[16];   // x, y (image px), size, rotation
+uniform vec4  u_shapeMeta[16]; // cell, unused, unused, live
+uniform float u_shapeGrid;
+uniform int   u_shapeCount;
+uniform vec4  u_lens;          // color shift, hue shift, pixel x, direction +
+uniform float u_lensSat;
+uniform float u_lensSwap;
+
+uniform vec4  u_ripple[${RIPPLE_MAX}];   // xy centre, z birth time, w strength
+uniform float u_rsize;
+uniform float u_rdecay;
+uniform float u_rainbow;
+uniform vec4  u_press;       // xy centre, z strength, w radius
+
+out vec4 outColor;
+
+vec2 rot2(vec2 v, float a) {
+  float s = sin(a), c = cos(a);
+  return vec2(c * v.x - s * v.y, s * v.x + c * v.y);
+}
+float hash1(float n) {
+  return fract(sin(n * 12.9898 + u_seed * 7.13) * 43758.5453);
+}
+vec3 hash3(float n) {
+  return vec3(hash1(n), hash1(n + 17.31), hash1(n + 43.77));
+}
+vec3 rgb2hsv(vec3 c) {
+  vec4 K = vec4(0.0, -1.0 / 3.0, 2.0 / 3.0, -1.0);
+  vec4 p = mix(vec4(c.bg, K.wz), vec4(c.gb, K.xy), step(c.b, c.g));
+  vec4 q = mix(vec4(p.xyw, c.r), vec4(c.r, p.yzx), step(p.x, c.r));
+  float d = q.x - min(q.w, q.y);
+  return vec3(abs(q.z + (q.w - q.y) / (6.0 * d + 1e-10)), d / (q.x + 1e-10), q.x);
+}
+vec3 hsv2rgb(vec3 c) {
+  vec4 K = vec4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
+  vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
+  return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
+}
+/* snap a point to the pixel grid, at whatever size and angle we ask for */
+vec2 quantize(vec2 p, float ps, float ang, float infl, out vec2 cell) {
+  vec2 g = rot2(p - u_texSize * 0.5, -ang);
+  if (infl > 0.001) {                            // the smudge
+    float n = hash1(floor(g.x / ps) * 3.17 + floor(g.y / ps) * 7.71);
+    g += (vec2(n, hash1(n * 13.0)) - 0.5) * ps * 3.0 * infl * u_rainbow;
+  }
+  cell = floor(g / ps);
+  return rot2((cell + 0.5) * ps, ang) + u_texSize * 0.5;
+}
+
+vec3 palAt(float i) {
+  int n = max(u_count, 1);
+  int k = int(mod(i, float(n)));
+  return mix(u_palette[k], hash3(i * 1.37 + u_seed), u_random);
+}
+vec3 palMix(float idx) {
+  float f = floor(idx), fr = fract(idx);
+  vec3 a = palAt(f), b = palAt(f + 1.0);
+  float t = u_blend < 0.001 ? 0.0 : clamp((fr - (1.0 - u_blend)) / u_blend, 0.0, 1.0);
+  return mix(a, b, t);
+}
+
+void main() {
+  /* --- screen pixel -> image pixel ------------------------------ */
+  vec2 p = gl_FragCoord.xy - u_view.xy;
+  vec2 c = p - u_view.zw * 0.5 - u_pan;
+  vec2 q = c / u_scale + u_texSize * 0.5;
+
+  /* --- pressure + ripples --------------------------------------- */
+  float infl = 0.0;
+  vec2  disp = vec2(0.0);
+
+  // ripple size is a percentage of the artwork, so a 4000px scan and a
+  // 720p webcam frame behave the same way
+  float rs = max(u_rsize * 0.01 * min(u_texSize.x, u_texSize.y), 1.0);
+
+  if (u_press.z > 0.001) {                       // a finger on the glass
+    float pr = rs * 3.2;
+    vec2 rel = q - u_press.xy;
+    float d = length(rel) + 1e-4;
+    float g = exp(-(d * d) / (2.0 * pr * pr));
+    disp -= (rel / d) * g * pr * 0.5 * u_press.z;
+    infl = max(infl, g * u_press.z);
+  }
+
+  for (int i = 0; i < ${RIPPLE_MAX}; i++) {      // rings leaving the touch
+    vec4 R = u_ripple[i];
+    if (R.w <= 0.001) continue;
+    float age = u_time - R.z;
+    if (age < 0.0 || age > 5.0) continue;
+    vec2 rel = q - R.xy;
+    float d = length(rel) + 1e-4;
+    float front = d - age * rs * 7.0;
+    float wide  = rs * 2.6;
+    float env   = exp(-age * u_rdecay) * exp(-(front * front) / (2.0 * wide * wide));
+    disp += (rel / d) * sin(front / rs * 3.14159) * env * R.w * rs * 1.7;
+    infl  = max(infl, clamp(env * R.w * 1.5, 0.0, 1.0));
+  }
+  q += disp;
+
+  /* --- motion: the colour field turns, swirls and undulates ------ */
+  float baseAngle = u_angle + u_turn;
+
+  if (abs(u_swirl) > 0.0005) {                   // a vortex, strongest at the centre
+    vec2 rel0 = q - u_texSize * 0.5;
+    float f = 1.0 - clamp(length(rel0) / (length(u_texSize) * 0.5), 0.0, 1.0);
+    q = u_texSize * 0.5 + rot2(rel0, u_swirl * f * f);
+  }
+
+  if (abs(u_wave) > 0.0005) {                    // a travelling swell, along the direction
+    vec2 w = rot2(q - u_texSize * 0.5, -baseAngle);
+    float lam = max(min(u_texSize.x, u_texSize.y) / 3.0, 1.0);
+    w.y += u_wave * sin(w.x / lam * 6.2831853 + u_waveT);
+    w.x += u_wave * 0.45 * sin(w.y / lam * 6.2831853 - u_waveT * 0.8);
+    q = rot2(w, baseAngle) + u_texSize * 0.5;
+  }
+
+  /* --- pixelate (pixels shatter smaller under pressure) ---------- */
+  float ps = max(u_pixel, 1.0);
+  ps = mix(ps, max(ps * 0.22, 1.0), infl);
+
+  vec2 cell;
+  vec2 qp = quantize(q, ps, baseAngle, infl, cell);
+
+  /* --- shapes are lenses: they never cover the artwork, they only
+         change how the pixels underneath get coloured --------------- */
+  float lens = 0.0;      // coverage of the strongest shape here
+  for (int i = 0; i < 16; i++) {
+    if (i >= u_shapeCount) break;
+    vec4 X = u_shapeXf[i];
+    vec4 M = u_shapeMeta[i];
+    if (M.w < 0.5 || X.z < 0.001) continue;
+    vec2 l = rot2(qp - X.xy, -X.w) / X.z + 0.5;         // into the shape's own box
+    if (l.x < 0.0 || l.x > 1.0 || l.y < 0.0 || l.y > 1.0) continue;
+    float cl = floor(mod(M.x, u_shapeGrid));
+    float rw = floor(M.x / u_shapeGrid);
+    float cov = texture(u_shapes, (vec2(cl, rw) + vec2(l.x, 1.0 - l.y)) / u_shapeGrid).a;
+    lens = max(lens, cov);
+  }
+  float k = lens;
+
+  // inside a shape the grid itself can change size and direction,
+  // so the pixels get re-snapped before anything is sampled
+  float angle = baseAngle + u_lens.w * k;
+  float psL = max(ps * (1.0 + (u_lens.z - 1.0) * k), 1.0);
+  if (lens > 0.002) qp = quantize(q, psL, angle, infl, cell);
+
+  vec2 uv = qp / u_texSize;
+  uv.x = mix(uv.x, 1.0 - uv.x, u_mirror);
+  if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+    outColor = vec4(u_bg, 1.0);
+    return;
+  }
+
+  /* --- ink or paper? -------------------------------------------- */
+  vec3 src = texture(u_tex, uv).rgb;
+  float lum = dot(src, vec3(0.299, 0.587, 0.114));
+  lum = clamp((lum - 0.5) * u_contrast + 0.5 + u_bright, 0.0, 1.0);
+
+  /* --- which colour? -------------------------------------------- */
+  vec2 rel = qp - u_texSize * 0.5;
+  float band = max(u_band, 1.0);
+  float idx;
+  if (u_mode < 0.5) {
+    // bands: the colour depends on how far along the direction you are
+    idx = dot(rel, vec2(cos(angle), sin(angle))) / band;
+  } else {
+    // runs: walk the pixels in order and change colour every u_spread of them,
+    // exactly the way the first version of this sketch did it
+    vec2 c2 = floor(qp / psL);
+    float across = floor(u_texSize.x / psL) + 1.0;
+    idx = (c2.y * across + c2.x) / max(u_spread, 1.0);
+  }
+
+  float ang = atan(rel.y, rel.x);
+  float rad = length(rel);
+  idx += u_spiral * (ang * 1.90986 + rad / band * u_twist);
+  idx += u_phase;
+  idx += u_lens.x * k;                            // the shape walks the palette on
+
+  vec3 col = palMix(idx);
+
+  vec3 hsv = rgb2hsv(col);
+  hsv.x = fract(hsv.x + u_hue + u_lens.y * k);
+  hsv.y = clamp(hsv.y * u_sat * (1.0 + (u_lensSat - 1.0) * k), 0.0, 1.0);
+  col = hsv2rgb(hsv);
+
+  if (infl > 0.001) {                             // rainbow bruise around the touch
+    float h = fract(ang * 0.159 + rad * 0.004 + u_time * 0.25
+                    + hash1(cell.x * 7.3 + cell.y * 13.1) * 0.4);
+    col = mix(col, hsv2rgb(vec3(h, 0.95, 1.0)), clamp(infl * u_rainbow, 0.0, 1.0));
+  }
+
+  float ink = 1.0 - smoothstep(u_threshold - max(u_soft, 0.002),
+                               u_threshold + max(u_soft, 0.002), lum);
+  // a shape can flip ink and paper inside itself, and it cancels
+  // cleanly against the global swap
+  float inv = mod(u_invert + step(0.5, u_lensSwap * lens), 2.0);
+  ink = mix(ink, 1.0 - ink, inv);
+
+  vec3 outc = mix(u_paper, col, ink) + infl * 0.10;
+  outColor = vec4(outc, 1.0);
+}`;
+
+function compile(type, src) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src);
+  gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+    console.error(gl.getShaderInfoLog(sh), src);
+    throw new Error("shader");
+  }
+  return sh;
+}
+
+const prog = gl.createProgram();
+gl.attachShader(prog, compile(gl.VERTEX_SHADER, VERT));
+gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FRAG));
+gl.linkProgram(prog);
+if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) console.error(gl.getProgramInfoLog(prog));
+gl.useProgram(prog);
+
+const vao = gl.createVertexArray();
+gl.bindVertexArray(vao);
+const buf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+const aPos = gl.getAttribLocation(prog, "a_pos");
+gl.enableVertexAttribArray(aPos);
+gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+const U = {};
+function u(name) {
+  if (!(name in U)) U[name] = gl.getUniformLocation(prog, name);
+  return U[name];
+}
+
+const tex = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, tex);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE,
+              new Uint8Array([32, 32, 32, 255]));
+
+let texW = 1, texH = 1, hasSource = false;
+
+/* a CPU copy of the source, only so the eyedropper can read pixels */
+const sampler = document.createElement("canvas");
+const sctx = sampler.getContext("2d", { willReadFrequently: true });
+
+/* ---------------------------------------------------------------
+   3. SOURCES — file, drag & drop, paste, webcam
+   --------------------------------------------------------------- */
+
+const video = document.getElementById("video");
+const fileInput = document.getElementById("file");
+const stage = document.getElementById("stage");
+const emptyEl = document.getElementById("empty");
+const docName = document.getElementById("docName");
+let camOn = false, camStream = null;
+
+function uploadFromElement(el, w, h) {
+  const cap = gl.getParameter(gl.MAX_TEXTURE_SIZE) || 4096;
+  let src = el;
+  if (Math.max(w, h) > cap) {                  // bigger than this GPU can hold
+    const k = cap / Math.max(w, h);
+    const c = document.createElement("canvas");
+    c.width = Math.max(1, Math.round(w * k));
+    c.height = Math.max(1, Math.round(h * k));
+    c.getContext("2d").drawImage(el, 0, 0, c.width, c.height);
+    src = c; w = c.width; h = c.height;
+  }
+  texW = w; texH = h;
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, src);
+  hasSource = true;
+  emptyEl.hidden = true;
+}
+
+function cacheForPicking(el, w, h) {
+  const k = Math.min(1, 1600 / Math.max(w, h));
+  sampler.width = Math.max(1, Math.round(w * k));
+  sampler.height = Math.max(1, Math.round(h * k));
+  sctx.save();
+  if (camOn && S.mirror) { sctx.translate(sampler.width, 0); sctx.scale(-1, 1); }
+  sctx.drawImage(el, 0, 0, sampler.width, sampler.height);
+  sctx.restore();
+}
+
+function loadImage(src, name) {
+  const im = new Image();
+  im.onload = () => {
+    stopCam();
+    uploadFromElement(im, im.naturalWidth, im.naturalHeight);
+    cacheForPicking(im, im.naturalWidth, im.naturalHeight);
+    docName.textContent = name || "untitled";
+    S.autofit = true;
+    S.zoom = 1; S.panX = 0; S.panY = 0;
+  };
+  im.onerror = () => { if (!hasSource) emptyEl.hidden = false; };
+  im.src = src;
+}
+
+function loadFile(f) {
+  if (!f || !f.type.startsWith("image/")) return;
+  const url = URL.createObjectURL(f);
+  loadImage(url, f.name);
+}
+
+fileInput.addEventListener("change", e => loadFile(e.target.files[0]));
+const pickFile = () => fileInput.click();
+
+document.getElementById("btnImport").onclick = pickFile;
+document.getElementById("emptyImport").onclick = pickFile;
+
+["dragenter", "dragover"].forEach(t =>
+  stage.addEventListener(t, e => { e.preventDefault(); stage.classList.add("over"); }));
+["dragleave", "drop"].forEach(t =>
+  stage.addEventListener(t, e => { e.preventDefault(); stage.classList.remove("over"); }));
+stage.addEventListener("drop", e => {
+  const f = e.dataTransfer.files[0];
+  if (f) loadFile(f);
+});
+window.addEventListener("paste", e => {
+  for (const item of e.clipboardData.files) { loadFile(item); break; }
+});
+
+["dragover", "drop"].forEach(t =>
+  window.addEventListener(t, e => { if (!stage.contains(e.target)) e.preventDefault(); }));
+
+async function startCam() {
+  try {
+    camStream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false
+    });
+    video.srcObject = camStream;
+    await video.play();
+    camOn = true;
+    hasSource = true;
+    emptyEl.hidden = true;
+    docName.textContent = "webcam";
+    S.autofit = true; S.zoom = 1; S.panX = 0; S.panY = 0;
+    syncChrome();
+  } catch (err) {
+    console.warn(err);
+    alert("Could not open the webcam. Check the camera permission for this page.\n(Live Server / https / localhost only.)");
+  }
+}
+function stopCam() {
+  if (camStream) camStream.getTracks().forEach(t => t.stop());
+  camStream = null; camOn = false;
+  syncChrome();
+}
+function toggleCam() { camOn ? stopCam() : startCam(); }
+document.getElementById("btnCam").onclick = toggleCam;
+document.getElementById("emptyCam").onclick = toggleCam;
+
+/* freeze the live webcam into a still image you can keep working on */
+function freezeCam() {
+  if (!camOn) return;
+  const w = video.videoWidth, h = video.videoHeight;
+  const c = document.createElement("canvas");
+  c.width = w; c.height = h;
+  const x = c.getContext("2d");
+  if (S.mirror) { x.translate(w, 0); x.scale(-1, 1); }
+  x.drawImage(video, 0, 0);
+  loadImage(c.toDataURL("image/png"), "webcam still");
+}
+
+function pumpCam() {
+  if (!camOn || video.readyState < 2) return;
+  const w = video.videoWidth, h = video.videoHeight;
+  if (!w) return;
+  texW = w; texH = h;
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
+}
+
+/* ---------------------------------------------------------------
+   3b. SHAPES — draw one on the artwork and it becomes a colour lens.
+       It never covers the drawing; it re-colours the pixels inside it.
+   --------------------------------------------------------------- */
+
+const SHAPE_GRID = 4;                       // 4 x 4 cells of atlas
+const SHAPE_CELL = 256;
+const SHAPE_MAX  = SHAPE_GRID * SHAPE_GRID;
+
+const shapes = [];   // one entry per shape; its index is its atlas cell
+
+const atlas = document.createElement("canvas");
+atlas.width = atlas.height = SHAPE_GRID * SHAPE_CELL;
+const actx = atlas.getContext("2d");
+
+const shapeTex = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, shapeTex);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+/* paint one shape into its atlas cell, with a margin so neighbouring
+   cells can never bleed into each other */
+function rasterize(i) {
+  const e = shapes[i];
+  const x = (i % SHAPE_GRID) * SHAPE_CELL, y = Math.floor(i / SHAPE_GRID) * SHAPE_CELL;
+  const pad = SHAPE_CELL * 0.06, inner = SHAPE_CELL - pad * 2;
+  actx.save();
+  actx.clearRect(x, y, SHAPE_CELL, SHAPE_CELL);
+  actx.translate(x + pad, y + pad);
+  actx.beginPath();
+  e.draw(actx, inner);
+  actx.fillStyle = "#fff";
+  actx.fill();
+  actx.restore();
+}
+
+function rasterizeAll() {
+  actx.clearRect(0, 0, atlas.width, atlas.height);
+  for (let i = 0; i < shapes.length; i++) rasterize(i);
+  gl.bindTexture(gl.TEXTURE_2D, shapeTex);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, atlas);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+}
+
+function removeNearest(q) {
+  if (!q || !shapes.length) return;
+  let best = -1, bd = Infinity;
+  shapes.forEach((n, i) => {
+    const d = Math.hypot(n.x - q[0], n.y - q[1]);
+    if (d < bd) { bd = d; best = i; }
+  });
+  if (best >= 0) { shapes.splice(best, 1); rasterizeAll(); }
+}
+
+function clearShapes() { shapes.length = 0; rasterizeAll(); }
+
+function animateShapes(dt) {
+  const cx = texW / 2, cy = texH / 2;
+  const span = Math.min(texW, texH);
+  shapes.forEach(n => {
+    n.rot += S.shapeSpin * DEG * dt;
+    if (S.shapeMotion === 1) {                     // orbit the centre
+      n.orbit += S.shapeSpeed * dt * (0.25 + n.seed * 0.5);
+      n.x = cx + Math.cos(n.orbit) * n.orbitR;
+      n.y = cy + Math.sin(n.orbit) * n.orbitR;
+    } else if (S.shapeMotion === 2) {              // drift and bounce
+      const v = S.shapeSpeed * span * 0.16 * dt * (0.5 + n.seed);
+      n.x += n.vx * v; n.y += n.vy * v;
+      if (n.x < 0) { n.x = 0; n.vx = Math.abs(n.vx); }
+      if (n.x > texW) { n.x = texW; n.vx = -Math.abs(n.vx); }
+      if (n.y < 0) { n.y = 0; n.vy = Math.abs(n.vy); }
+      if (n.y > texH) { n.y = texH; n.vy = -Math.abs(n.vy); }
+    }
+  });
+}
+
+const xfBuf = new Float32Array(SHAPE_MAX * 4);
+const metaBuf = new Float32Array(SHAPE_MAX * 4);
+
+function packShapes() {
+  xfBuf.fill(0); metaBuf.fill(0);
+  for (let i = 0; i < shapes.length; i++) {
+    const n = shapes[i];
+    xfBuf[i * 4] = n.x;
+    xfBuf[i * 4 + 1] = n.y;
+    xfBuf[i * 4 + 2] = Math.max(n.size, 1);
+    xfBuf[i * 4 + 3] = n.rot;
+    metaBuf[i * 4] = i;          // atlas cell
+    metaBuf[i * 4 + 3] = 1;      // live
+  }
+  return shapes.length;
+}
+
+/* drawing --------------------------------------------------------- */
+
+const ink = document.getElementById("ink");
+const ictx = ink.getContext("2d");
+let stroke = null;
+
+function sizeInk() {
+  const r = stage.getBoundingClientRect();
+  ink.width = Math.round(r.width * dpr);
+  ink.height = Math.round(r.height * dpr);
+  ictx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+
+function drawStroke() {
+  ictx.clearRect(0, 0, ink.width, ink.height);
+  if (!stroke || stroke.length < 2) return;
+  const r = stage.getBoundingClientRect();
+  ictx.beginPath();
+  stroke.forEach((p, i) => {
+    const x = p[0] - r.left, y = p[1] - r.top;
+    i ? ictx.lineTo(x, y) : ictx.moveTo(x, y);
+  });
+  ictx.closePath();
+  ictx.fillStyle = "rgba(13,153,255,0.16)";
+  ictx.fill();
+  ictx.strokeStyle = "#0d99ff";
+  ictx.lineWidth = 1.5;
+  ictx.lineJoin = ictx.lineCap = "round";
+  ictx.stroke();
+}
+
+/* the stroke lands where it was drawn, at the size it was drawn */
+function commitStroke() {
+  const pts = stroke;
+  stroke = null;
+  ictx.clearRect(0, 0, ink.width, ink.height);
+  if (!pts || pts.length < 4 || !hasSource) return;
+
+  const img = pts.map(p => screenToImage(p[0], p[1])).filter(Boolean);
+  if (img.length < 4) return;
+
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  img.forEach(p => {
+    x0 = Math.min(x0, p[0]); y0 = Math.min(y0, p[1]);
+    x1 = Math.max(x1, p[0]); y1 = Math.max(y1, p[1]);
+  });
+  const bw = Math.max(x1 - x0, 1), bh = Math.max(y1 - y0, 1), size = Math.max(bw, bh);
+  if (size < Math.min(texW, texH) * 0.01) return;      // a stray tap, not a shape
+
+  const ox = (size - bw) / 2, oy = (size - bh) / 2;
+  const norm = img.map(p => [(p[0] - x0 + ox) / size, (p[1] - y0 + oy) / size]);
+  const ang = Math.random() * TAU;
+
+  if (shapes.length >= SHAPE_MAX) shapes.shift();
+  const cx = x0 + bw / 2, cy = y0 + bh / 2;
+  shapes.push({
+    draw: (c, s) => {
+      norm.forEach((p, i) => {
+        const x = p[0] * s, y = (1 - p[1]) * s;     // canvas y runs the other way
+        i ? c.lineTo(x, y) : c.moveTo(x, y);
+      });
+      c.closePath();
+    },
+    x: cx, y: cy, size,
+    rot: 0,
+    seed: Math.random(),
+    orbit: Math.atan2(cy - texH / 2, cx - texW / 2),
+    orbitR: Math.hypot(cx - texW / 2, cy - texH / 2),
+    vx: Math.cos(ang), vy: Math.sin(ang)
+  });
+  rasterizeAll();
+}
+
+/* ---------------------------------------------------------------
+   4. VIEWPORTS — one canvas, many screens
+   --------------------------------------------------------------- */
+
+const GRIDS = { 1: [1, 1], 2: [2, 1], 3: [3, 1], 4: [2, 2], 6: [3, 2] };
+let views = [];
+let dpr = 1;
+
+function layout(mult) {
+  mult = mult || 1;
+  const [cols, rows] = GRIDS[S.screens] || GRIDS[1];
+  const W = canvas.width, H = canvas.height;
+  const gap = S.screens > 1 ? Math.round(2 * dpr * mult) : 0;
+  const vw = (W - gap * (cols - 1)) / cols;
+  const vh = (H - gap * (rows - 1)) / rows;
+  views = [];
+  for (let r = 0; r < rows; r++) {
+    for (let cidx = 0; cidx < cols; cidx++) {
+      views.push({
+        x: Math.round(cidx * (vw + gap)),
+        y: Math.round(H - (r + 1) * vh - r * gap),   // GL origin is bottom-left
+        w: Math.round(vw),
+        h: Math.round(vh)
+      });
+    }
+  }
+}
+
+function resize() {
+  dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const r = stage.getBoundingClientRect();
+  const w = Math.max(1, Math.round(r.width * dpr));
+  const h = Math.max(1, Math.round(r.height * dpr));
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w; canvas.height = h;
+  }
+  layout();
+  if (typeof sizeInk === "function") sizeInk();
+}
+new ResizeObserver(resize).observe(stage);
+
+/* how much the artwork must shrink to sit fully inside one screen */
+function fitScale(v) {
+  if (!texW || !texH) return 1;
+  return Math.min(v.w / texW, v.h / texH) * 0.92;
+}
+const viewScale = v => fitScale(v) * S.zoom;
+
+/* ---------------------------------------------------------------
+   5. RENDER
+   --------------------------------------------------------------- */
+
+const rippleBuf = new Float32Array(RIPPLE_MAX * 4);
+const palBuf = new Float32Array(8 * 3);
+
+function hexRGB(h) {
+  return [parseInt(h.slice(1, 3), 16) / 255,
+          parseInt(h.slice(3, 5), 16) / 255,
+          parseInt(h.slice(5, 7), 16) / 255];
+}
+
+function pressInImage() {
+  if (!pressPt) return [0, 0, 0, 1];
+  const q = screenToImage(pressPt.clientX, pressPt.clientY);
+  if (!q) return [0, 0, 0, 1];
+  return [q[0], q[1], S.press, 1];
+}
+
+function render(mult) {
+  mult = mult || 1;
+  gl.useProgram(prog);
+  gl.bindVertexArray(vao);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.uniform1i(u("u_tex"), 0);
+
+  gl.clearColor(0.169, 0.169, 0.169, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+
+  // palette
+  const n = Math.min(S.palette.length, 8);
+  for (let i = 0; i < n; i++) {
+    const c = hexRGB(S.palette[i]);
+    palBuf[i * 3] = c[0]; palBuf[i * 3 + 1] = c[1]; palBuf[i * 3 + 2] = c[2];
+  }
+  gl.uniform3fv(u("u_palette"), palBuf);
+  gl.uniform1i(u("u_count"), n);
+  gl.uniform3fv(u("u_paper"), hexRGB(S.paper));
+  gl.uniform3fv(u("u_bg"), [0.169, 0.169, 0.169]);
+
+  // ripples
+  rippleBuf.fill(0);
+  for (let i = 0; i < Math.min(ripples.length, RIPPLE_MAX); i++) {
+    const r = ripples[ripples.length - 1 - i];
+    rippleBuf[i * 4] = r.x; rippleBuf[i * 4 + 1] = r.y;
+    rippleBuf[i * 4 + 2] = r.t; rippleBuf[i * 4 + 3] = r.w;
+  }
+  gl.uniform4fv(u("u_ripple"), rippleBuf);
+
+  const pulse = 1 + S.pulse * Math.sin(S.time * S.pulseRate * TAU * 0.25);
+
+  gl.uniform2f(u("u_texSize"), texW, texH);
+  gl.uniform1f(u("u_time"), S.time);
+  gl.uniform1f(u("u_pixel"), S.pixel * mult);
+  gl.uniform1f(u("u_band"), S.band);
+  gl.uniform1f(u("u_mode"), S.mode);
+  gl.uniform1f(u("u_spread"), S.spread);
+  gl.uniform1f(u("u_blend"), S.blend);
+  gl.uniform1f(u("u_threshold"), S.threshold);
+  gl.uniform1f(u("u_soft"), S.soft);
+  gl.uniform1f(u("u_invert"), S.invert);
+  gl.uniform1f(u("u_contrast"), S.contrast * pulse);
+  gl.uniform1f(u("u_bright"), S.bright);
+  gl.uniform1f(u("u_random"), S.random);
+  gl.uniform1f(u("u_twist"), S.twist);
+  gl.uniform1f(u("u_turn"), S.turnPhase);
+  // at rate 0 the swirl and the swell simply hold their shape
+  gl.uniform1f(u("u_swirl"), S.swirl * (S.mrate > 0 ? Math.sin(S.time * S.mrate * 1.4) : 1));
+  gl.uniform1f(u("u_wave"), S.wave * 0.01 * Math.min(texW, texH));
+  gl.uniform1f(u("u_waveT"), S.time * S.mrate * 3.0);
+  gl.uniform1f(u("u_sat"), S.sat);
+  gl.uniform1f(u("u_seed"), S.seed);
+  gl.activeTexture(gl.TEXTURE1);
+  gl.bindTexture(gl.TEXTURE_2D, shapeTex);
+  gl.uniform1i(u("u_shapes"), 1);
+  gl.uniform1f(u("u_shapeGrid"), SHAPE_GRID);
+  gl.uniform4f(u("u_lens"), S.shapeShift, S.shapeHue / 360, S.shapePix, S.shapeAngle * DEG);
+  gl.uniform1f(u("u_lensSat"), S.shapeSat);
+  gl.uniform1f(u("u_lensSwap"), S.shapeSwap ? 1 : 0);
+  gl.uniform1i(u("u_shapeCount"), packShapes());
+  gl.uniform4fv(u("u_shapeXf"), xfBuf);
+  gl.uniform4fv(u("u_shapeMeta"), metaBuf);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.uniform1f(u("u_rsize"), S.rsize);
+  gl.uniform1f(u("u_rdecay"), S.rdecay);
+  gl.uniform1f(u("u_rainbow"), S.rainbow);
+
+  gl.uniform1f(u("u_mirror"), camOn && S.mirror ? 1 : 0);
+
+  const spiral = S.spiral + S.spiralKick;
+  const press = pressInImage();
+
+  for (let i = 0; i < views.length; i++) {
+    const v = views[i];
+    const k = i * S.variation;                     // how far this screen drifts
+    const sc = viewScale(v) * mult;
+
+    gl.viewport(v.x, v.y, v.w, v.h);
+    gl.uniform4f(u("u_view"), v.x, v.y, v.w, v.h);
+    gl.uniform1f(u("u_scale"), sc);
+    gl.uniform2f(u("u_pan"), S.panX * sc, S.panY * sc);
+    gl.uniform1f(u("u_angle"), S.angle * DEG + k * 0.55);
+    gl.uniform1f(u("u_phase"), S.phase + k * 2.3);
+    gl.uniform1f(u("u_hue"), S.hue + k * 0.11);
+    gl.uniform1f(u("u_spiral"), spiral + k * 0.35);
+    gl.uniform4fv(u("u_press"), press);
+
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+  }
+}
+
+let last = performance.now(), fps = 60, frames = 0, fpsClock = last;
+
+function loop(now) {
+  const dt = Math.min((now - last) / 1000, 0.1);
+  last = now;
+  S.time += dt;
+  S.phase += S.flow * dt;
+  S.turnPhase += S.turn * DEG * dt;
+  animateShapes(dt);
+  S.spiralKick *= Math.pow(0.12, dt);             // every click's spiral unwinds
+  if (S.spiralKick < 0.0005) S.spiralKick = 0;
+  while (ripples.length && S.time - ripples[0].t > 5) ripples.shift();
+
+  pumpCam();
+  if (S.autofit) { S.zoom = 1; S.panX = 0; S.panY = 0; }
+  if (hasSource) render();
+
+  frames++;
+  if (now - fpsClock > 500) {
+    fps = Math.round(frames * 1000 / (now - fpsClock));
+    frames = 0; fpsClock = now;
+    updateHUD();
+  }
+  requestAnimationFrame(loop);
+}
+
+let hudNote = "", hudNoteAt = -99;
+function note(text) { hudNote = text; hudNoteAt = S.time; updateHUD(); }
+
+function updateHUD() {
+  if (hudNote && S.time - hudNoteAt < 6) {
+    document.getElementById("hud").textContent = hudNote;
+    return;
+  }
+  const v = views[0];
+  const z = v ? Math.round(viewScale(v) / dpr * 100) : 100;
+  document.getElementById("zVal").textContent = z + "%";
+  document.getElementById("hud").innerHTML =
+    `${texW} × ${texH} <i>/</i> ${S.screens} screen${S.screens > 1 ? "s" : ""}` +
+    ` <i>/</i> ${S.palette.length} colors` +
+    (shapes.length ? ` <i>/</i> ${shapes.length} shapes` : "") +
+    ` <i>/</i> ${fps} fps` +
+    (camOn ? ` <i>/</i> live` : "");
+}
+
+/* ---------------------------------------------------------------
+   6. POINTER — click anywhere, the colors move
+   --------------------------------------------------------------- */
+
+function viewAt(clientX, clientY) {
+  const r = canvas.getBoundingClientRect();
+  const px = (clientX - r.left) * dpr;
+  const pyGL = canvas.height - (clientY - r.top) * dpr;
+  return views.find(v => px >= v.x && px <= v.x + v.w && pyGL >= v.y && pyGL <= v.y + v.h)
+      || views[0];
+}
+
+function screenToImage(clientX, clientY, v) {
+  v = v || viewAt(clientX, clientY);
+  if (!v) return null;
+  const r = canvas.getBoundingClientRect();
+  const px = (clientX - r.left) * dpr;
+  const pyGL = canvas.height - (clientY - r.top) * dpr;
+  const sc = viewScale(v);
+  let cx = px - v.x - v.w / 2 - S.panX * sc;
+  let cy = pyGL - v.y - v.h / 2 - S.panY * sc;
+  return [cx / sc + texW / 2, cy / sc + texH / 2];
+}
+
+function addRipple(q, strength) {
+  if (!q) return;
+  ripples.push({ x: q[0], y: q[1], t: S.time, w: strength });
+  if (ripples.length > RIPPLE_MAX) ripples.shift();
+}
+
+function spinColors() {
+  S.phase += 1 + Math.random() * 4;
+  S.spiralKick = Math.max(S.spiralKick, 0.9 + Math.random() * 0.9);
+  S.seed = Math.random() * 100;
+}
+
+function pickColor(q) {
+  if (!q || !sampler.width) return;
+  if (camOn) cacheForPicking(video, video.videoWidth, video.videoHeight);
+  const x = Math.round(q[0] / texW * sampler.width);
+  const y = Math.round(sampler.height - q[1] / texH * sampler.height);   // GL space is flipped
+  if (x < 0 || y < 0 || x >= sampler.width || y >= sampler.height) return;
+  let d;
+  try { d = sctx.getImageData(x, y, 1, 1).data; }
+  catch (err) { return; }          // file:// taints the canvas; serve the folder instead
+  const hex = "#" + [d[0], d[1], d[2]].map(n => n.toString(16).padStart(2, "0")).join("");
+  S.palette[S.active] = hex;
+  buildPalette();
+}
+
+let dragging = null;
+
+canvas.addEventListener("pointerdown", e => {
+  if (!hasSource) return;
+  try { canvas.setPointerCapture(e.pointerId); } catch (err) { /* synthetic pointer */ }
+  const v = viewAt(e.clientX, e.clientY);
+  const q = screenToImage(e.clientX, e.clientY, v);
+
+  if (S.tool === "move" || e.button === 1 || spaceDown) {
+    dragging = { x: e.clientX, y: e.clientY, panX: S.panX, panY: S.panY, v };
+    stage.classList.add("dragging");
+    S.autofit = false;
+    return;
+  }
+  if (S.tool === "pick") { pickColor(q); return; }
+
+  if (S.tool === "draw") {
+    if (e.altKey || e.button === 2) { removeNearest(q); return; }
+    stroke = [[e.clientX, e.clientY]];
+    return;
+  }
+
+  // recolor + ripple both leave a mark; recolor also throws the palette
+  pressPt = { clientX: e.clientX, clientY: e.clientY };
+  addRipple(q, S.press);
+  if (S.tool === "recolor") spinColors();
+});
+
+canvas.addEventListener("pointermove", e => {
+  if (dragging) {
+    const sc = viewScale(dragging.v);
+    S.panX = dragging.panX + (e.clientX - dragging.x) * dpr / sc;
+    S.panY = dragging.panY - (e.clientY - dragging.y) * dpr / sc;
+    return;
+  }
+  if (stroke) {
+    const pt = [e.clientX, e.clientY];
+    const last = stroke[stroke.length - 1];
+    if (Math.hypot(pt[0] - last[0], pt[1] - last[1]) > 2) stroke.push(pt);
+    drawStroke();
+    return;
+  }
+  if (pressPt) {
+    pressPt.clientX = e.clientX;
+    pressPt.clientY = e.clientY;
+    if (S.time - (pressPt.last || 0) > 0.14) {
+      pressPt.last = S.time;
+      addRipple(screenToImage(e.clientX, e.clientY), S.press * 0.7);
+    }
+  } else if (S.tool === "pick" && e.buttons === 1) {
+    pickColor(screenToImage(e.clientX, e.clientY));
+  }
+});
+
+function endPointer() {
+  if (stroke) { commitStroke(); dragging = null; return; }
+  if (pressPt) addRipple(screenToImage(pressPt.clientX, pressPt.clientY), S.press);
+  pressPt = null;
+  dragging = null;
+  stage.classList.remove("dragging");
+}
+canvas.addEventListener("pointerup", endPointer);
+canvas.addEventListener("pointercancel", endPointer);
+canvas.addEventListener("pointerleave", () => { pressPt = null; });
+canvas.addEventListener("contextmenu", e => {
+  if (S.tool === "draw") e.preventDefault();       // right-click removes a shape
+});
+
+canvas.addEventListener("wheel", e => {
+  e.preventDefault();
+  const v = viewAt(e.clientX, e.clientY);
+  const before = screenToImage(e.clientX, e.clientY, v);
+  S.autofit = false;
+  const f = Math.exp(-e.deltaY * 0.0015);
+  S.zoom = Math.min(40, Math.max(0.05, S.zoom * f));
+  const after = screenToImage(e.clientX, e.clientY, v);
+  if (before && after) {                            // keep the point under the cursor
+    S.panX += after[0] - before[0];
+    S.panY += after[1] - before[1];
+  }
+}, { passive: false });
+
+let spaceDown = false;
+addEventListener("keydown", e => {
+  if (/input|textarea/i.test(e.target.tagName)) return;
+  if (e.code === "Space") { spaceDown = true; e.preventDefault(); return; }
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  const k = e.key.toLowerCase();
+  if (k === "v") setTool("move");
+  else if (k === "c") setTool("recolor");
+  else if (k === "r") setTool("ripple");
+  else if (k === "i") setTool("pick");
+  else if (k === "p") setTool("draw");
+  else if (k === "x") { S.invert = S.invert ? 0 : 1; syncPanel(); }
+  else if (k === "s") { shufflePalette(); }
+  else if (k === "f") { fitView(); }
+  else if (k === "[") { S.pixel = Math.max(1, S.pixel - 1); syncPanel(); }
+  else if (k === "]") { S.pixel = Math.min(120, S.pixel + 1); syncPanel(); }
+});
+addEventListener("keyup", e => { if (e.code === "Space") spaceDown = false; });
+
+function fitView() { S.autofit = true; S.zoom = 1; S.panX = 0; S.panY = 0; }
+document.getElementById("zFit").onclick = fitView;
+document.getElementById("zIn").onclick = () => { S.autofit = false; S.zoom *= 1.25; };
+document.getElementById("zOut").onclick = () => { S.autofit = false; S.zoom /= 1.25; };
+
+/* ---------------------------------------------------------------
+   7. TOOLBAR
+   --------------------------------------------------------------- */
+
+const I = {
+  move:  '<path d="M4 2l9 7-4 1-1.5 4z" fill="currentColor"/>',
+  recolor:'<circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M8 2a6 6 0 010 12z" fill="currentColor"/><circle cx="8" cy="8" r="1.8" fill="currentColor"/>',
+  ripple:'<circle cx="8" cy="8" r="1.6" fill="currentColor"/><circle cx="8" cy="8" r="4" fill="none" stroke="currentColor" stroke-width="1.2" opacity=".75"/><circle cx="8" cy="8" r="6.6" fill="none" stroke="currentColor" stroke-width="1.2" opacity=".4"/>',
+  pick:  '<path d="M10.5 2.2a2 2 0 012.8 2.8l-1.1 1.1 1 1-1.4 1.4-1-1-5 5-2.9.7.7-2.9 5-5-1-1L9 2.9l1 1z" fill="currentColor"/>',
+  swap:  '<path d="M3 5h8M9 3l2 2-2 2M13 11H5m2-2l-2 2 2 2" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>',
+  shuffle:'<path d="M2 4h3l6 8h3M2 12h3l2-2.6M11 10.6L14 12l-3 1.4M11 2.6L14 4l-3 1.4" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>',
+  fit:   '<path d="M2 6V2h4M14 6V2h-4M2 10v4h4M14 10v4h-4" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>',
+  cam:   '<rect x="1.5" y="4" width="9" height="8" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M10.5 8l4-2.5v5L10.5 8z" fill="currentColor"/>',
+  import:'<path d="M8 2v8m0 0L5 7m3 3l3-3M2.5 12.5h11" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>',
+  draw:  '<path d="M2 14l1-3.2 7.4-7.4a1.6 1.6 0 012.2 2.2L5.2 13 2 14z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/><path d="M9.4 4.4l2.2 2.2" stroke="currentColor" stroke-width="1.3"/>'
+};
+const svg = d => `<svg viewBox="0 0 16 16">${d}</svg>`;
+
+const TOOLS = [
+  ["move",    "Move / pan  V"],
+  ["recolor", "Recolor — click to spin the colors  C"],
+  ["ripple",  "Press — ripple the pixels  R"],
+  ["pick",    "Eyedropper — sample a color  I"],
+  ["draw",    "Draw a color shape  P"]
+];
+
+const rail = document.getElementById("rail");
+TOOLS.forEach(([id, tip]) => {
+  const b = document.createElement("button");
+  b.className = "tool";
+  b.dataset.tool = id;
+  b.dataset.tip = tip;
+  b.innerHTML = svg(I[id]);
+  b.onclick = () => setTool(id);
+  rail.appendChild(b);
+});
+rail.appendChild(document.createElement("hr"));
+[["swap", "Swap color / white  X", () => { S.invert = S.invert ? 0 : 1; syncPanel(); }],
+ ["shuffle", "Shuffle palette  S", () => shufflePalette()],
+ ["fit", "Fit to screen  F", () => fitView()],
+ ["cam", "Toggle webcam", () => toggleCam()],
+ ["import", "Import image", () => pickFile()]
+].forEach(([id, tip, fn]) => {
+  const b = document.createElement("button");
+  b.className = "tool";
+  b.dataset.tip = tip;
+  b.innerHTML = svg(I[id]);
+  b.onclick = fn;
+  rail.appendChild(b);
+});
+
+function setTool(t) {
+  S.tool = t;
+  stage.dataset.tool = t;
+  rail.querySelectorAll("[data-tool]").forEach(b =>
+    b.setAttribute("aria-pressed", b.dataset.tool === t));
+}
+setTool("recolor");
+
+/* ---------------------------------------------------------------
+   8. PANEL — built from a spec so every control behaves the same
+   --------------------------------------------------------------- */
+
+const PRESETS = {
+  "Hot":     ["#ff3366", "#ffcc00", "#00ccff", "#33ff99", "#9933ff"],
+  "Risograph": ["#ff4b3e", "#0b6ef4", "#ffd400", "#00a878"],
+  "Chrome":  ["#f2f2f2", "#8a8a8a", "#1d1d1d", "#4d7cff"],
+  "Sunburn": ["#ff006e", "#fb5607", "#ffbe0b", "#8338ec", "#3a86ff"],
+  "Moss":    ["#0b3d2e", "#3f7d5c", "#a7c957", "#f2e8cf"],
+  "Mono":    ["#111111", "#ffffff"]
+};
+
+const SPEC = [
+  { title: "Source", open: true, rows: [
+    { t: "actions", items: [
+      ["Import image", () => pickFile()],
+      ["Webcam", () => toggleCam(), "camBtn"]
+    ]},
+    { t: "actions", items: [
+      ["Freeze frame", () => freezeCam(), "freezeBtn"],
+      ["Fit to screen", () => fitView()]
+    ]},
+    { t: "toggle", k: "mirror", label: "Mirror cam" },
+    { t: "hint", html: "Drop a file anywhere on the canvas, or paste one with <kbd>⌘V</kbd>." }
+  ]},
+
+  { title: "Palette", open: true, rows: [
+    { t: "palette" },
+    { t: "presets" },
+    { t: "slider", k: "random", label: "Randomness", min: 0, max: 1, step: 0.01 },
+    { t: "color", k: "paper", label: "Paper" },
+    { t: "actions", items: [
+      ["Shuffle", () => shufflePalette()],
+      ["Swap areas", () => { S.invert = S.invert ? 0 : 1; syncPanel(); }]
+    ]}
+  ]},
+
+  { title: "Pixels", open: true, rows: [
+    { t: "seg", k: "mode", label: "Color by", opts: [[0, "Bands"], [1, "Pixel run"]] },
+    { t: "slider", k: "pixel", label: "Pixel size", min: 1, max: 120, step: 1 },
+    { t: "slider", k: "angle", label: "Direction", min: 0, max: 360, step: 1 },
+    { t: "seg", k: "angle", label: "", opts: [[0, "→"], [45, "↘"], [90, "↑"], [135, "↖"]] },
+    { t: "slider", k: "band", label: "Band width", min: 2, max: 900, step: 1 },
+    { t: "slider", k: "spread", label: "Spread", min: 1, max: 5000, step: 1 },
+    { t: "slider", k: "blend", label: "Blend", min: 0, max: 1, step: 0.01 },
+    { t: "slider", k: "threshold", label: "White point", min: 0, max: 1, step: 0.005 },
+    { t: "slider", k: "soft", label: "Edge", min: 0, max: 0.4, step: 0.005 },
+    { t: "seg", k: "invert", label: "Areas", opts: [[0, "Ink"], [1, "Swapped"]] },
+    { t: "hint", html: "<b>Bands</b> uses <b>Band width</b> — colour by position. <b>Pixel run</b> uses <b>Spread</b> — count that many pixels, then switch colour, the way version 1 worked." }
+  ]},
+
+  { title: "Color", open: false, rows: [
+    { t: "slider", k: "hue", label: "Hue", min: -0.5, max: 0.5, step: 0.005 },
+    { t: "slider", k: "sat", label: "Saturation", min: 0, max: 2, step: 0.01 },
+    { t: "slider", k: "contrast", label: "Contrast", min: 0.2, max: 4, step: 0.01 },
+    { t: "slider", k: "bright", label: "Brightness", min: -0.5, max: 0.5, step: 0.005 },
+    { t: "slider", k: "pulse", label: "Flash", min: 0, max: 2.5, step: 0.01 },
+    { t: "slider", k: "pulseRate", label: "Flash rate", min: 0.1, max: 12, step: 0.1 }
+  ]},
+
+  { title: "Motion", open: false, rows: [
+    { t: "slider", k: "flow", label: "Flow", min: -8, max: 8, step: 0.05 },
+    { t: "slider", k: "turn", label: "Turn °/s", min: -180, max: 180, step: 1 },
+    { t: "slider", k: "spiral", label: "Spiral", min: 0, max: 3, step: 0.01 },
+    { t: "slider", k: "twist", label: "Twist", min: -4, max: 4, step: 0.02 },
+    { t: "slider", k: "swirl", label: "Swirl", min: -3, max: 3, step: 0.01 },
+    { t: "slider", k: "wave", label: "Wave", min: 0, max: 8, step: 0.05 },
+    { t: "slider", k: "mrate", label: "Rate", min: 0, max: 3, step: 0.01 },
+    { t: "hint", html: "<b>Flow</b> marches the colors along. <b>Turn</b> sweeps the whole color field round while the artwork stays put. <b>Swirl</b> winds the pixels into a vortex and back out. <b>Wave</b> sends a swell across them. <b>Rate</b> times the last two — at 0 they hold still." }
+  ]},
+
+  { title: "Touch", open: false, rows: [
+    { t: "slider", k: "press", label: "Pressure", min: 0, max: 2, step: 0.01 },
+    { t: "slider", k: "rsize", label: "Ripple size", min: 0.2, max: 20, step: 0.1 },
+    { t: "slider", k: "rdecay", label: "Fade", min: 0.2, max: 6, step: 0.05 },
+    { t: "slider", k: "rainbow", label: "Rainbow smudge", min: 0, max: 2, step: 0.01 },
+    { t: "hint", html: "Hold the <b>Press</b> tool on the artwork — the pixels dent, shatter and bleed like a finger on a CRT." }
+  ]},
+
+  { title: "Screens", open: false, rows: [
+    { t: "seg", k: "screens", label: "Count", opts: [[1, "1"], [2, "2"], [3, "3"], [4, "4"], [6, "6"]], after: () => layout() },
+    { t: "slider", k: "variation", label: "Variation", min: 0, max: 3, step: 0.01 },
+    { t: "hint", html: "Every screen runs the same artwork through a different point in the palette." }
+  ]},
+
+  { title: "Export", open: true, rows: [
+    { t: "seg", k: "exportScale", label: "Resolution", opts: [[1, "1×"], [2, "2×"], [4, "4×"], [8, "8×"]] },
+    { t: "actions", items: [
+      ["Save PNG", () => savePNG()],
+      ["Save SVG", () => saveSVG()]
+    ]},
+    { t: "actions", items: [
+      ["Record video", () => toggleRecord(), "recBtn"]
+    ]},
+    { t: "hint", html: "PNG and SVG both export at the chosen multiple of the canvas. <b>SVG</b> traces the colored blocks as real vectors, so it stays sharp at any size — keep <b>Blend</b> at 0 for the cleanest file. Video records at screen size, 60fps, as <b>MP4 / H.264</b> — ready to drop into any editor. Browsers cannot write .mov, and fall back to WebM only if they have no MP4 encoder." }
+  ]},
+
+  { title: "Shapes", open: false, rows: [
+    { t: "actions", items: [
+      ["Draw shape", () => setTool("draw")],
+      ["Clear shapes", () => clearShapes()]
+    ]},
+    { t: "hint", html: "Draw an outline on the artwork with the pen. It never covers the drawing — it re-colors the pixels inside it. Alt-click a shape to remove it." },
+    { t: "slider", k: "shapeShift", label: "Color shift", min: -8, max: 8, step: 0.05 },
+    { t: "slider", k: "shapeHue", label: "Hue shift", min: -180, max: 180, step: 1 },
+    { t: "slider", k: "shapeSat", label: "Saturation", min: 0, max: 3, step: 0.01 },
+    { t: "slider", k: "shapePix", label: "Pixel size ×", min: 0.1, max: 8, step: 0.05 },
+    { t: "slider", k: "shapeAngle", label: "Direction +", min: -180, max: 180, step: 1 },
+    { t: "toggle", k: "shapeSwap", label: "Swap inside" },
+    { t: "seg", k: "shapeMotion", label: "Motion",
+      opts: [[0, "Still"], [1, "Orbit"], [2, "Drift"]] },
+    { t: "slider", k: "shapeSpeed", label: "Speed", min: 0, max: 4, step: 0.02 },
+    { t: "slider", k: "shapeSpin", label: "Spin °/s", min: -360, max: 360, step: 1 }
+  ]}
+];
+
+const panel = document.getElementById("panel");
+const bound = [];   // [element, key, kind] — for syncPanel()
+
+function makeSlider(row) {
+  const wrap = document.createElement("div");
+  wrap.className = "row";
+  wrap.innerHTML = `<label>${row.label}</label><div class="ctl">
+      <input type="range" min="${row.min}" max="${row.max}" step="${row.step}">
+      <input class="num" type="number" min="${row.min}" max="${row.max}" step="${row.step}">
+    </div>`;
+  const [rng, num] = wrap.querySelectorAll("input");
+  const dp = row.step < 0.1 ? 3 : (row.step < 1 ? 2 : 0);
+  const push = val => {
+    S[row.k] = val;
+    rng.value = val;
+    num.value = String(+(+val).toFixed(dp));
+    if (row.after) row.after();
+  };
+  rng.addEventListener("input", () => push(+rng.value));
+  num.addEventListener("change", () => push(Math.max(row.min, Math.min(row.max, +num.value))));
+  push(S[row.k]);
+  bound.push([push, row.k]);
+  return wrap;
+}
+
+function makeSeg(row) {
+  const wrap = document.createElement("div");
+  wrap.className = "row" + (row.label ? "" : " wide");
+  const seg = document.createElement("div");
+  seg.className = "seg";
+  row.opts.forEach(([val, txt]) => {
+    const b = document.createElement("button");
+    b.textContent = txt;
+    b.onclick = () => {
+      S[row.k] = val;
+      if (row.after) row.after();
+      syncPanel();
+    };
+    b._val = val;
+    seg.appendChild(b);
+  });
+  if (row.label) wrap.innerHTML = `<label>${row.label}</label>`;
+  wrap.appendChild(seg);
+  bound.push([() => {
+    seg.querySelectorAll("button").forEach(b =>
+      b.setAttribute("aria-pressed", S[row.k] === b._val));
+  }, row.k, "seg"]);
+  return wrap;
+}
+
+function makeToggle(row) {
+  const wrap = document.createElement("div");
+  wrap.className = "row";
+  wrap.innerHTML = `<label>${row.label}</label>`;
+  const b = document.createElement("button");
+  b.className = "sw";
+  b.onclick = () => { S[row.k] = !S[row.k]; syncPanel(); };
+  wrap.appendChild(b);
+  bound.push([() => b.setAttribute("aria-pressed", !!S[row.k]), row.k, "sw"]);
+  return wrap;
+}
+
+function makeColor(row) {
+  const wrap = document.createElement("div");
+  wrap.className = "row";
+  wrap.innerHTML = `<label>${row.label}</label>`;
+  const chip = document.createElement("button");
+  chip.className = "chip";
+  const inp = document.createElement("input");
+  inp.type = "color";
+  chip.appendChild(inp);
+  inp.oninput = () => { S[row.k] = inp.value; chip.style.background = inp.value; };
+  wrap.appendChild(chip);
+  bound.push([() => { inp.value = S[row.k]; chip.style.background = S[row.k]; }, row.k, "color"]);
+  return wrap;
+}
+
+function makeActions(row) {
+  const wrap = document.createElement("div");
+  wrap.className = row.items.length > 1 ? "grid2" : "grid1";
+  row.items.forEach(([label, fn, id]) => {
+    const b = document.createElement("button");
+    b.className = "btn";
+    b.textContent = label;
+    b.onclick = fn;
+    if (id) b.id = id;
+    wrap.appendChild(b);
+  });
+  return wrap;
+}
+
+function makeLabel(row) {
+  const d = document.createElement("div");
+  d.className = "grouplabel";
+  d.textContent = row.text;
+  return d;
+}
+
+function makeHint(row) {
+  const d = document.createElement("div");
+  d.className = "hint";
+  d.innerHTML = row.html;
+  return d;
+}
+
+let paletteHost, presetHost;
+
+SPEC.forEach(sec => {
+  const d = document.createElement("details");
+  d.className = "sec";
+  if (sec.open) d.open = true;
+  d.innerHTML = `<summary>${sec.title}</summary>`;
+  const body = document.createElement("div");
+  body.className = "content";
+  sec.rows.forEach(row => {
+    if (row.t === "slider")  body.appendChild(makeSlider(row));
+    else if (row.t === "seg") body.appendChild(makeSeg(row));
+    else if (row.t === "toggle") body.appendChild(makeToggle(row));
+    else if (row.t === "color")  body.appendChild(makeColor(row));
+    else if (row.t === "actions") body.appendChild(makeActions(row));
+    else if (row.t === "hint") body.appendChild(makeHint(row));
+    else if (row.t === "label") body.appendChild(makeLabel(row));
+    else if (row.t === "palette") {
+      paletteHost = document.createElement("div");
+      paletteHost.className = "swatches";
+      body.appendChild(paletteHost);
+        } else if (row.t === "presets") {
+      presetHost = document.createElement("div");
+      presetHost.className = "presets";
+      body.appendChild(presetHost);
+    }
+  });
+  d.appendChild(body);
+  panel.appendChild(d);
+});
+
+function syncPanel() {
+  bound.forEach(([fn, k, kind]) => kind ? fn() : fn(S[k]));
+  syncChrome();
+}
+
+function syncChrome() {
+  const camBtn = document.getElementById("camBtn");
+  const topCam = document.getElementById("btnCam");
+  if (camBtn) camBtn.textContent = camOn ? "Stop webcam" : "Webcam";
+  if (topCam) topCam.textContent = camOn ? "Stop cam" : "Webcam";
+  const fz = document.getElementById("freezeBtn");
+  if (fz) fz.disabled = !camOn;
+}
+
+/* palette UI ---------------------------------------------------- */
+
+function buildPalette() {
+  paletteHost.innerHTML = "";
+  S.palette.forEach((hex, i) => {
+    const chip = document.createElement("button");
+    chip.className = "chip";
+    chip.style.background = hex;
+    chip.dataset.active = i === S.active;
+    const inp = document.createElement("input");
+    inp.type = "color";
+    inp.value = hex;
+    inp.oninput = () => { S.palette[i] = inp.value; chip.style.background = inp.value; };
+    chip.appendChild(inp);
+    chip.onclick = e => {
+      S.active = i;
+      paletteHost.querySelectorAll(".chip").forEach((c, j) => c.dataset.active = j === i);
+      if (e.target !== inp) inp.click();
+    };
+    if (S.palette.length > 2) {
+      const kill = document.createElement("button");
+      kill.className = "kill";
+      kill.textContent = "×";
+      kill.onclick = e => {
+        e.stopPropagation();
+        S.palette.splice(i, 1);
+        S.active = 0;
+        buildPalette();
+      };
+      chip.appendChild(kill);
+    }
+    paletteHost.appendChild(chip);
+  });
+  if (S.palette.length < 8) {
+    const add = document.createElement("button");
+    add.className = "chip add";
+    add.textContent = "+";
+    add.title = "Add a color";
+    add.onclick = () => {
+      S.palette.push(randomHex());
+      S.active = S.palette.length - 1;
+      buildPalette();
+    };
+    paletteHost.appendChild(add);
+  }
+}
+
+function buildPresets() {
+  presetHost.innerHTML = "";
+  Object.entries(PRESETS).forEach(([name, cols]) => {
+    const b = document.createElement("button");
+    b.className = "preset";
+    b.title = name;
+    cols.forEach(c => {
+      const s = document.createElement("span");
+      s.style.background = c;
+      b.appendChild(s);
+    });
+    b.onclick = () => { S.palette = cols.slice(); S.active = 0; buildPalette(); };
+    presetHost.appendChild(b);
+  });
+}
+
+const randomHex = () => "#" + Math.floor(Math.random() * 0xffffff).toString(16).padStart(6, "0");
+function shufflePalette() {
+  S.palette = S.palette.map(randomHex);
+  S.seed = Math.random() * 100;
+  buildPalette();
+}
+
+buildPalette();
+buildPresets();
+syncPanel();
+
+/* ---------------------------------------------------------------
+   9. CAPTURE
+   --------------------------------------------------------------- */
+
+function stamp() {
+  return new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+}
+function download(blob, name) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+}
+
+function savePNG() {
+  if (!hasSource) return;
+  const m = S.exportScale;
+  const maxDim = gl.getParameter(gl.MAX_TEXTURE_SIZE) || 4096;
+  const w = canvas.width, h = canvas.height;
+  const mult = Math.min(m, Math.floor(maxDim / Math.max(w, h)) || 1);
+  canvas.width = w * mult;
+  canvas.height = h * mult;
+  layout(mult);
+  render(mult);
+  const restore = () => { canvas.width = w; canvas.height = h; layout(); render(); };
+  try {
+    canvas.toBlob(blob => {
+      if (blob) download(blob, `bypixel-${stamp()}-${mult}x.png`);
+      restore();
+    }, "image/png");
+  } catch (err) {
+    restore();
+    alert("Export needs the page served over http — open the folder with Live Server, not as a file.");
+  }
+}
+document.getElementById("btnPng").onclick = savePNG;
+
+/* ---- SVG ----------------------------------------------------------
+   The picture is already made of flat blocks of colour, so it vectorises
+   honestly: read the rendered frame back, merge neighbouring cells of the
+   same colour into runs, then into rectangles, and write one path per
+   colour. Whatever is on screen — lenses, ripples, swirl — comes along,
+   because we are reading the result, not re-deriving it.
+   ------------------------------------------------------------------- */
+
+function saveSVG() {
+  if (!hasSource) return;
+  const W0 = canvas.width, H0 = canvas.height;
+
+  // Resolution only decides how big the SVG prints — it is vector, so there is
+  // nothing to gain from reading back a huge frame. We sample just finely
+  // enough that every pixel block is caught, and no finer.
+  const blockNow = Math.max(0.25, S.pixel * viewScale(views[0]));
+  let mult = Math.max(1, Math.min(4, Math.ceil(3 / blockNow)));
+  while (mult > 1 && (W0 * mult) * (H0 * mult) > 24e6) mult--;
+
+  canvas.width = W0 * mult;
+  canvas.height = H0 * mult;
+  layout(mult);
+  render(mult);
+
+  const W = canvas.width, H = canvas.height;
+  const buf = new Uint8Array(W * H * 4);
+  gl.readPixels(0, 0, W, H, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+
+  canvas.width = W0; canvas.height = H0;     // put the view back straight away
+  layout();
+  render();
+
+  // about two samples across every pixel block, and never a silly total
+  const blockPx = Math.max(1, S.pixel * viewScale(views[0]) * mult);
+  let step = Math.max(1, Math.round(blockPx / 2));
+  while ((W / step) * (H / step) > 400000) step++;
+
+  const cols = Math.floor(W / step), rows = Math.floor(H / step);
+  const half = Math.floor(step / 2);
+  // Colours are matched loosely so that antialiased edges merge into their
+  // neighbours instead of becoming a rectangle each — but every group is
+  // painted with a real sampled colour, so flat areas keep your exact hex.
+  const snap = c => (c + 4) >> 3;
+  const keyOf = (r, g, b) => (snap(r) << 10) | (snap(g) << 5) | snap(b);
+  const bgKey = keyOf(43, 43, 43);
+  const trueColor = new Map();
+
+  const line = new Int32Array(cols);
+  const rects = [];
+  let prev = new Map();
+
+  for (let r = 0; r < rows; r++) {
+    const gy = H - 1 - (r * step + half);            // readPixels counts from the bottom
+    if (gy < 0) break;
+    const rowBase = gy * W * 4;
+    for (let c = 0; c < cols; c++) {
+      const i = rowBase + (c * step + half) * 4;
+      const k = keyOf(buf[i], buf[i + 1], buf[i + 2]);
+      if (!trueColor.has(k))
+        trueColor.set(k, ((buf[i] << 16) | (buf[i + 1] << 8) | buf[i + 2])
+                          .toString(16).padStart(6, "0"));
+      line[c] = k;
+    }
+
+    const next = new Map();
+    let a = 0;
+    for (let c = 1; c <= cols; c++) {
+      if (c < cols && line[c] === line[a]) continue;
+      const id = a + ":" + c + ":" + line[a];
+      const held = prev.get(id);
+      if (held) { held.h++; next.set(id, held); }    // same run as the row above: grow it
+      else {
+        const t = { a, b: c, k: line[a], y: r, h: 1 };
+        rects.push(t);
+        next.set(id, t);
+      }
+      a = c;
+    }
+    prev = next;
+  }
+
+  const byColor = new Map();
+  let kept = 0;
+  for (const t of rects) {
+    if (t.k === bgKey) continue;                     // the workspace behind the art
+    const x = t.a * step, y = t.y * step;
+    const w = (t.b - t.a) * step, h = t.h * step;
+    let d = byColor.get(t.k);
+    if (!d) byColor.set(t.k, d = []);
+    d.push(`M${x} ${y}h${w}v${h}h${-w}z`);
+    kept++;
+  }
+
+  const paths = [];
+  for (const [k, d] of byColor)
+    paths.push(`<path fill="#${trueColor.get(k)}" d="${d.join("")}"/>`);
+
+  const outW = Math.round(W0 * S.exportScale), outH = Math.round(H0 * S.exportScale);
+  const svg =
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${outW}" height="${outH}" ` +
+    `viewBox="0 0 ${W} ${H}" shape-rendering="crispEdges">\n` +
+    `<rect width="${W}" height="${H}" fill="#2b2b2b"/>\n` +
+    paths.join("\n") + `\n</svg>\n`;
+
+  const blob = new Blob([svg], { type: "image/svg+xml" });
+  download(blob, `bypixel-${stamp()}.svg`);
+  note(`SVG · ${kept.toLocaleString()} shapes · ${byColor.size} colors · ` +
+       `${outW}×${outH} · ${Math.round(blob.size / 1024)} KB`);
+}
+
+/* Editors want H.264 in an MP4. Browsers will not hand out a QuickTime .mov
+   from MediaRecorder at all, so MP4 is the real target and WebM is only the
+   last resort. A browser can claim a type and still refuse to build the
+   recorder, so we try each one for real and keep the first that works. */
+const VIDEO_TYPES = [
+  { mime: "video/mp4;codecs=avc1.640028", ext: "mp4",  label: "MP4 · H.264" },
+  { mime: "video/mp4;codecs=avc1.42E01E", ext: "mp4",  label: "MP4 · H.264" },
+  { mime: "video/mp4",                    ext: "mp4",  label: "MP4" },
+  { mime: "video/webm;codecs=vp9",        ext: "webm", label: "WebM · VP9" },
+  { mime: "video/webm",                   ext: "webm", label: "WebM" }
+];
+
+function makeRecorder(stream) {
+  for (const t of VIDEO_TYPES) {
+    if (!MediaRecorder.isTypeSupported(t.mime)) continue;
+    try {
+      return { rec: new MediaRecorder(stream, { mimeType: t.mime, videoBitsPerSecond: 40e6 }), t };
+    } catch (err) { /* said yes, meant no — on to the next */ }
+  }
+  return null;
+}
+
+let recorder = null, chunks = [];
+function toggleRecord() {
+  const btns = [document.getElementById("btnRec"), document.getElementById("recBtn")].filter(Boolean);
+  if (recorder && recorder.state === "recording") { recorder.stop(); return; }
+  if (!hasSource) return;
+  if (typeof MediaRecorder === "undefined" || typeof canvas.captureStream !== "function") {
+    note("This browser cannot record video.");
+    return;
+  }
+
+  const stream = canvas.captureStream(60);
+  const made = makeRecorder(stream);
+  if (!made) {
+    stream.getTracks().forEach(t => t.stop());
+    note("No video encoder available in this browser.");
+    return;
+  }
+  const { rec, t } = made;
+  recorder = rec;
+  chunks = [];
+  rec.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
+  rec.onstop = () => {
+    stream.getTracks().forEach(tr => tr.stop());
+    const blob = new Blob(chunks, { type: t.ext === "mp4" ? "video/mp4" : "video/webm" });
+    download(blob, `bypixel-${stamp()}.${t.ext}`);
+    note(`${t.label} · ${canvas.width}×${canvas.height} · ${Math.round(blob.size / 1048576)} MB`);
+    btns.forEach(b => { b.dataset.on = "false"; b.textContent = b.dataset.label || "Record"; });
+  };
+  rec.start();
+  note(`Recording · ${t.label}`);
+  btns.forEach(b => { b.dataset.on = "true"; b.textContent = "Stop & save"; });
+}
+document.getElementById("btnRec").onclick = toggleRecord;
+
+/* ---------------------------------------------------------------
+   10. GO
+   --------------------------------------------------------------- */
+
+resize();
+emptyEl.hidden = false;
+loadImage("shot.png", "shot.png");       // the scan that ships with this folder
+requestAnimationFrame(loop);
+</script>
+
+</body>
+</html>
