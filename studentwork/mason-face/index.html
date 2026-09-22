@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>SAY IT LIKE YOU MEAN IT</title>
+<link rel="stylesheet" href="css/styles.css" />
+</head>
+<body>
+
+<!-- ============ STAGE (camera + hidden tracking) ============ -->
+<div id="stage">
+  <video id="cam" playsinline autoplay muted></video>
+  <!-- abstraction layer: hidden from the participant, visible only in admin -->
+  <canvas id="fx"></canvas>
+  <div id="vignette"></div>
+</div>
+
+<!-- ============ PARTICIPANT UI ============ -->
+<main id="ui">
+
+  <section class="screen" data-screen="boot">
+    <div class="stack">
+      <p class="kicker">initialising</p>
+      <h1 class="mega">WAKING UP<span class="dots"></span></h1>
+      <p class="sub" id="bootStatus">requesting camera…</p>
+    </div>
+  </section>
+
+  <section class="screen" data-screen="attract">
+    <div class="stack">
+      <p class="kicker blink">step up</p>
+      <h1 class="mega">YOU ARE ABOUT<br />TO BE RECORDED</h1>
+      <p class="sub big">AND YOUR <em>FACIAL EXPRESSIONS</em> WILL BE TRACKED.</p>
+      <button class="cta" data-action="begin">I'M READY</button>
+      <p class="fine">Video and audio are captured on this device. Nothing is uploaded.</p>
+    </div>
+  </section>
+
+  <section class="screen" data-screen="prompt">
+    <div class="stack">
+      <p class="kicker">your prompt</p>
+      <h1 class="mega" id="promptText">SAY “I LOVE YOU”</h1>
+      <p class="sub big">TO THE CAMERA. OUT LOUD.</p>
+      <div class="count" id="countdown">3</div>
+    </div>
+  </section>
+
+  <section class="screen" data-screen="recording">
+    <div class="topbar">
+      <span class="rec"><i></i>REC</span>
+      <span class="take" id="takeLabel">TAKE 1</span>
+      <span class="timer" id="timer">0.0</span>
+    </div>
+    <div class="stack bottom">
+      <h1 class="mega line" id="liveLine">SAY “I LOVE YOU”</h1>
+      <button class="cta ghost" data-action="stop">DONE</button>
+    </div>
+  </section>
+
+  <section class="screen" data-screen="again">
+    <div class="stack">
+      <p class="kicker">not good enough</p>
+      <h1 class="mega shout">SAY IT AGAIN<br />LIKE YOU MEAN IT</h1>
+      <p class="sub big" id="againSub">we're going again in…</p>
+      <div class="count" id="againCount">3</div>
+    </div>
+  </section>
+
+  <section class="screen" data-screen="choice">
+    <div class="stack">
+      <p class="kicker">take <span id="choiceTake">2</span></p>
+      <h1 class="mega">WAS THAT REAL?</h1>
+      <div class="row">
+        <button class="cta" data-action="satisfied">THAT'S THE ONE</button>
+        <button class="cta ghost" data-action="retry">TRY AGAIN</button>
+      </div>
+      <p class="fine" id="choiceFine">You can go as many times as you need.</p>
+    </div>
+  </section>
+
+  <section class="screen" data-screen="done">
+    <div class="stack">
+      <p class="kicker">saved</p>
+      <h1 class="mega">THANK YOU<br />FOR MEANING IT</h1>
+      <p class="sub" id="doneSub">downloading the whole interaction…</p>
+      <button class="cta ghost" data-action="reset">START OVER</button>
+    </div>
+  </section>
+
+</main>
+
+<!-- ============ ADMIN ============ -->
+<div id="adminToggle" title="Admin (A)">●</div>
+
+<aside id="admin" hidden>
+  <header>
+    <h2>ADMIN <small id="adminFps">–</small></h2>
+    <div class="admin-actions">
+      <button id="launchBtn" class="mini solid">LAUNCH EXPERIENCE ▸</button>
+      <button id="closeAdmin" class="mini">CLOSE</button>
+    </div>
+  </header>
+
+  <nav class="tabs">
+    <button class="tab is-on" data-tab="layers">Abstractions</button>
+    <button class="tab" data-tab="flow">Flow</button>
+    <button class="tab" data-tab="refs">References</button>
+    <button class="tab" data-tab="data">Data</button>
+  </nav>
+
+  <div class="tabpane is-on" data-pane="layers">
+    <div class="bar">
+      <select id="addShape"></select>
+      <button id="addLayer" class="mini solid">+ Layer</button>
+      <button id="dupLayer" class="mini">Duplicate</button>
+      <button id="delLayer" class="mini danger">Delete</button>
+    </div>
+    <div class="bar">
+      <label class="chk"><input type="checkbox" id="showFx" checked /> Show abstraction preview</label>
+      <label class="chk"><input type="checkbox" id="showMesh" /> Show raw mesh</label>
+      <label class="chk"><input type="checkbox" id="soloLayer" /> Solo selected</label>
+    </div>
+    <ul id="layerList"></ul>
+    <div id="layerProps"></div>
+  </div>
+
+  <div class="tabpane" data-pane="flow"><div id="flowProps"></div></div>
+
+  <div class="tabpane" data-pane="refs">
+    <p class="hint">Drop reference images here. They render as a tracing overlay in admin only — never in the participant view, never in the recording.</p>
+    <div id="dropzone">DROP REFERENCE IMAGES</div>
+    <div class="bar">
+      <label class="rng">Overlay opacity <input type="range" id="refOpacity" min="0" max="1" step="0.01" value="0.45" /></label>
+      <button id="clearRefs" class="mini danger">Clear</button>
+    </div>
+    <div id="refList"></div>
+    <p class="hint">Layers of type <b>image</b> can use any loaded reference as artwork pinned to a facial feature — pick it in the layer's <i>Artwork</i> field.</p>
+  </div>
+
+  <div class="tabpane" data-pane="data">
+    <div class="bar">
+      <button id="exportCfg" class="mini">Export config JSON</button>
+      <button id="importCfg" class="mini">Import config JSON</button>
+      <button id="resetCfg" class="mini danger">Reset to defaults</button>
+    </div>
+    <p class="hint">Config auto-saves to this browser. Reference images are stored with it (kept small).</p>
+    <div class="bar"><button id="testDownload" class="mini">Re-download last session</button></div>
+    <pre id="sessionLog">no session yet</pre>
+  </div>
+</aside>
+
+<div id="toast"></div>
+
+<script type="module" src="js/app.js"></script>
+</body>
+</html>
